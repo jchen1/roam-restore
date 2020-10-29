@@ -1,0 +1,4 @@
+{:deps
+{datascript/datascript {:mvn/version "1.0.1"}
+ cheshire {:mvn/version "5.10.0"}
+datascript-transit/datascript-transit {:mvn/version "0.3.0"}}}
