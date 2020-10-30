@@ -12,15 +12,33 @@
   [conn uid]
   (d/q `[:find ?e ?n :where [?e :block/uid ~uid] [?e :block/string ?n]] @conn))
 
+(defn regular-message?
+  [msg]
+  (when msg
+    (try
+      (not (string? (json/parse-string msg)))
+      (catch Throwable _
+        false))))
+
 (defn parse-har
   []
   (let [json (json/parse-string (slurp harfile) true)
         ws-messages (->> json :log :entries (filter #(some? (:_webSocketMessages %))) second :_webSocketMessages)
         ws-data (map :data ws-messages)
-        combined-data (-> (str "[" (string/join "" ws-data) "]")
-                          (string/replace #"\}\{" "},{")
-                          ;; yolo
-                          (string/replace #"\}(\d+)?\{" "},$1,{")
+        ;; hack attack: Roam sends a bunch of regular JSON bits in individual messages, then sends
+        ;; the entire snapshot db across several WS messages without closing the JSON
+        ;; we parse the entire JSON as a big array, so we need to add commas in between valid JSON objects
+        ;; this code does that in a turrible turrible way.
+        ws-json (map (fn [prev data]
+                       (cond
+                         (and (regular-message? data)
+                              (not (regular-message? prev))) (str "," data ",")
+                         (= "{}" data) data
+                         (regular-message? data) (str data ",")
+                         :else data))
+                      (-> ws-data (conj "{}"))
+                     (concat ws-data ["{}"]))
+        combined-data (-> (str "[" (string/join "" ws-json) "]")
                           (json/parse-string true))]
     combined-data))
 
@@ -84,4 +102,6 @@
         recovered (recover db blocks)]
     (spit outfile recovered)))
 
-(run)
+(comment
+  (parse-har)
+  (run))
