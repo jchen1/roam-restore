@@ -1,48 +1,36 @@
 (ns roam-restore
- (:require [datascript.transit :as dt]
-           [datascript.core :as d]
-           [cheshire.core :as json]
-           [clojure.string :as string]))
+  (:require [datascript.transit :as dt]
+            [datascript.core :as d]
+            [cheshire.core :as json]
+            [clojure.string :as string]))
 
 (def harfile "roamresearch.com.har")
 (def missing-date "10-28-2020")
 (def outfile "recovered.txt")
-
-(defn block-from-uid
-  [conn uid]
-  (d/q `[:find ?e ?n :where [?e :block/uid ~uid] [?e :block/string ?n]] @conn))
-
-(defn regular-message?
-  [msg]
-  (when msg
-    (try
-      (not (string? (json/parse-string msg)))
-      (catch Throwable _
-        false))))
 
 (defn parse-har
   []
   (let [json (json/parse-string (slurp harfile) true)
         ws-messages (->> json :log :entries (filter #(some? (:_webSocketMessages %))) second :_webSocketMessages)
         ws-data (map :data ws-messages)
-        ;; hack attack: Roam sends a bunch of regular JSON bits in individual messages, then sends
-        ;; the entire snapshot db across several WS messages without closing the JSON
-        ;; we parse the entire JSON as a big array, so we need to add commas in between valid JSON objects
-        ;; this code does that in a turrible turrible way.
-        ws-json (map (fn [prev data]
-                       (cond
-                         (and (regular-message? data)
-                              (not (regular-message? prev))) (str "," data ",")
-                         (= "{}" data) data
-                         (regular-message? data) (str data ",")
-                         :else data))
-                      (-> ws-data (conj "{}"))
-                     (concat ws-data ["{}"]))
-        combined-data (-> (str "[" (string/join "" ws-json) "]")
-                          (json/parse-string true))]
-    combined-data))
+        try-parse #(try (json/parse-string % true)
+                        (catch Throwable _ nil))
+        ;; Roam sends a series of JSON objects over WS messages.
+        ;; If an object is bigger than 16kb it's split across
+        ;; multiple messages - so we need to stitch them together.
+        ws-json (reduce (fn [{:keys [done partial]} next]
+                          (let [potential-json-str (str partial next)]
+                            (if-let [json (try-parse potential-json-str)]
+                              {:done (conj done json)
+                               :partial ""}
+                              {:done done
+                               :partial potential-json-str})))
+                        {:done [] :partial ""}
+                        ws-data)]
+    (assert (= (:partial ws-json) ""))
+    (:done ws-json)))
 
-(defn find-deleted-blocks
+(defn find-deletion-time
   [parsed-har]
   (let [nested-obj-is-delete? (fn [obj] (and (seqable? obj) (some (fn [[k v]] (= "delete-page" (some-> v :tx-meta :tx-name))) obj)))
         delete-page-event (->> parsed-har
@@ -51,13 +39,8 @@
                                (keep (fn [[k v]] (when (and (= "delete-page" (some-> v :tx-meta :tx-name))
                                                             (string/includes? (some-> v :tx) missing-date))
                                                    v)))
-                               first)
-        tx-parsed (dt/read-transit-str (:tx delete-page-event))]
-    {:blocks
-     (->> tx-parsed
-          (filter #(= :db.fn/retractEntity (first %)))
-          (map (comp second second)))
-     :time (:time delete-page-event)}))
+                               first)]
+    (:time delete-page-event)))
 
 (defn apply-transactions-until
   [db parsed-har until-time]
@@ -85,23 +68,35 @@
                     (string/join ""))]
     (dt/read-transit-str db-str)))
 
+(defn materialize
+  [{:keys [block/string] :as page} level]
+  (let [indent (* level 4)
+        children (->> (:block/children page)
+                      (sort-by :block/order)
+                      (map #(materialize % (inc level)))
+                      (map #(format "%s- %s" (apply str (repeat indent " ")) %))
+                      (string/join "\n"))]
+    (cond
+      (and string (not-empty children)) (str string "\n" children)
+      (not-empty children) children
+      string string
+      :else "")))
+
 (defn recover
-  [db deleted-blocks]
-  (let [conn (d/conn-from-db db)]
-    (->> deleted-blocks
-         (mapcat (partial block-from-uid conn))
-         (map second)
-         (string/join "\n"))))
+  [db]
+  (let [conn (d/conn-from-db db)
+        note-eid (ffirst (d/q `[:find ?e :where [?e :block/uid ~missing-date]] @conn))
+        page (d/pull db '[:block/string {:block/children [:block/order :block/string {:block/children ...}]}] note-eid)]
+    (materialize page 0)))
 
 (defn run
   []
   (let [parsed-har (parse-har)
         db (parse-db parsed-har)
-        {:keys [blocks time]} (find-deleted-blocks parsed-har)
+        time (find-deletion-time parsed-har)
         db (apply-transactions-until db parsed-har time)
-        recovered (recover db blocks)]
+        recovered (recover db)]
+    (println (format "Recovered %s - saved to %s!" missing-date outfile))
     (spit outfile recovered)))
 
-(comment
-  (parse-har)
-  (run))
+(run)
